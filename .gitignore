@@ -5,3 +5,6 @@ __pycache__/
 
 # Model artifacts written by PMG.ipynb (Section 25)
 artifacts/
+
+# keep the deployable model artifact for PMG_AI
+!PMG_AI/artifacts/
