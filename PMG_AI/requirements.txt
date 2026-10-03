@@ -1,0 +1,6 @@
+# Pinned to the versions used to train/save artifacts/pmg_predictor.joblib
+numpy>=2.0,<3
+pandas>=2.2,<3
+scikit-learn==1.7.2
+scipy>=1.13
+joblib>=1.4
