@@ -8,6 +8,10 @@ const isProd = process.env.NODE_ENV === 'production'; // production switches on 
 
 const config = {
   isProd,
+  // debug | info | summary | error  (see logger.js). Debug by default while the system is being tuned.
+  logLevel: process.env.LOG_LEVEL || 'debug',
+  // Folder for log files (pmg-backend.log = every line shown in the terminal, ml-exchange.jsonl = every ML request/response).
+  logDir: process.env.LOG_DIR || path.join(__dirname, '..', 'logs'),
   port: Number(process.env.PORT || 4000), // port this backend listens on
   // Base URL of the Flask ML endpoint (never exposed to the browser).
   mlUrl: process.env.ML_URL || 'http://127.0.0.1:5001',

@@ -2,6 +2,7 @@
 //   not signed in -> Login | signed in -> header + (New claim form | Result | My claims)
 import { useEffect, useState } from 'react';
 import { api } from './api.js';
+import { log } from './logger.js';
 import Login from './pages/Login.jsx';
 import ClaimForm from './pages/ClaimForm.jsx';
 import Result from './pages/Result.jsx';
@@ -16,13 +17,13 @@ export default function App() {
 
   // On first load, ask the backend whether the cookie is still valid so a refresh does not log the user out.
   useEffect(() => {
-    api.me().then((r) => setUser(r.user)).catch(() => setUser(null)).finally(() => setBooting(false));
+    api.me().then((r) => { log.info(`session restored for ${r.user.email}`); setUser(r.user); }).catch(() => setUser(null)).finally(() => setBooting(false));
   }, []);
 
   if (booting) return <div className="center muted">Loading…</div>;
-  if (!user) return <Login onLogin={setUser} />;
+  if (!user) return <Login onLogin={(u) => { log.summary(`signed in as ${u.email}`); setUser(u); }} />;
 
-  const logout = async () => { await api.logout().catch(() => {}); setUser(null); setView('form'); setResult(null); };
+  const logout = async () => { log.summary('user signed out'); await api.logout().catch(() => {}); setUser(null); setView('form'); setResult(null); };
   const startNew = () => { setResult(null); setFormKey((k) => k + 1); setView('form'); };
 
   return (

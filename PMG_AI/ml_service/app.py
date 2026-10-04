@@ -17,7 +17,6 @@ Run (dev):   python ml_service/app.py
 Run (prod):  python ml_service/serve.py        (waitress WSGI server, works on Windows/Linux)
 """
 import hmac
-import logging
 import os
 import pathlib
 import sys
@@ -25,22 +24,21 @@ import time
 
 # pmg_predict.py lives one folder up; make it importable no matter where we are launched from.
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT))                      # for pmg_predict
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # for pmg_logging (works under gunicorn too)
 
 import pandas as pd                      # noqa: E402  (import after sys.path tweak on purpose)
 from flask import Flask, jsonify, request  # noqa: E402
+from werkzeug.exceptions import HTTPException  # noqa: E402
 
 import pmg_predict as pmg                # noqa: E402  (feature pipeline + scorer, unchanged)
+from pmg_logging import log             # noqa: E402  (levels: debug/info/summary/error, see pmg_logging.py)
 
 # --------------------------------------------------------------------------------------
 # Configuration comes from environment variables (12-factor) - never hard-code secrets.
 # --------------------------------------------------------------------------------------
 API_KEY = os.environ.get("ML_API_KEY", "dev-ml-key-change-me")        # shared secret with the backend
 MAX_BODY_BYTES = 64 * 1024                                            # a claim is ~2 KB; reject huge bodies
-
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s %(levelname)s [ml] %(message)s")
-log = logging.getLogger("pmg-ml")
 
 # --------------------------------------------------------------------------------------
 # Allowed values for categorical inputs. Anything else is rejected with HTTP 422 instead of
@@ -107,8 +105,8 @@ def create_app() -> Flask:
 
     t0 = time.perf_counter()
     bundle = pmg.load_artifact()                                # heavy: unpickle the RandomForest (once!)
-    log.info("model '%s' loaded in %.0f ms (%d features, threshold %.4f)", bundle["model_name"],
-             (time.perf_counter() - t0) * 1000, len(bundle["feature_columns"]), bundle["threshold"])
+    log.summary(f"model '{bundle['model_name']}' loaded in {(time.perf_counter() - t0) * 1000:.0f} ms "
+                f"({len(bundle['feature_columns'])} features, threshold {bundle['threshold']:.4f}, log level: {log.level_name})")
 
     def authorised() -> bool:
         """Constant-time compare of the X-API-Key header (prevents timing attacks)."""
@@ -127,29 +125,48 @@ def create_app() -> Flask:
 
     @app.post("/v1/predict")
     def predict():
-        if not authorised():                                    # 1. authenticate the caller (backend only)
+        trace = request.headers.get("X-Trace-Id", "")[:40] or None   # claim id forwarded by the backend
+        if not authorised():                                        # 1. authenticate the caller (backend only)
+            log.error("REJECTED: missing/invalid X-API-Key", trace=trace)
             return jsonify(error="unauthorised"), 401
-        claim = request.get_json(silent=True)                   # 2. parse JSON (None if malformed)
+        claim = request.get_json(silent=True)                       # 2. parse JSON (None if malformed)
         if claim is None:
+            log.error("REJECTED: body is not valid JSON", trace=trace)
             return jsonify(error="body must be valid JSON"), 400
-        errs = validate_claim(claim)                            # 3. defence-in-depth validation
+        trace = trace or (claim.get("ClaimID") if isinstance(claim, dict) else None)
+        log.info("==== ML REQUEST RECEIVED  (backend -> ML model) ====",
+                 {"method": "POST", "path": "/v1/predict", "headers": {"X-API-Key": request.headers.get("X-API-Key", ""),
+                  "X-Trace-Id": trace, "Content-Type": request.headers.get("Content-Type")}, "body": claim}, trace=trace)
+        errs = validate_claim(claim)                                # 3. defence-in-depth validation
         if errs:
+            log.error("validation FAILED -> 422", errs, trace=trace)
             return jsonify(error="validation failed", details=errs), 422
+        log.info("validation passed", trace=trace)
+        raw_row = pd.DataFrame([{k: v for k, v in claim.items() if k not in ("ClaimID", "_scenario")}])
+        if log.enabled("debug"):                                    # show exactly what the model sees (only built when debugging)
+            feats = pmg.build_X(raw_row, bundle["feature_columns"])
+            nonzero = {c: (round(float(v), 4) if v == v else None) for c, v in feats.iloc[0].items() if v != 0}
+            log.debug(f"model input: {len(feats.columns)} features, {len(nonzero)} non-zero (zeros omitted)", nonzero, trace=trace)
         t = time.perf_counter()
-        result = pmg.score_claim(claim, bundle)                 # 4. derive -> engineer -> predict_proba -> decision
+        result = pmg.score_claim(claim, bundle)                     # 4. derive -> engineer -> predict_proba -> decision
         latency = round((time.perf_counter() - t) * 1000, 1)
         # 5. human-friendly business signals so the UI can explain the decision
-        d = pmg.derive_intermediate_fields(pd.DataFrame([{k: v for k, v in claim.items() if k != "ClaimID"}])).iloc[0]
+        d = pmg.derive_intermediate_fields(raw_row).iloc[0]
         signals = {"rateDifferenceAmount": round(float(d["RateDifferenceAmount"]), 2),
                    "rateDifferencePercent": round(float(d["RateDifferencePercent"]) * 100, 2),
                    "minimumThresholdMet": bool(d["MinimumClaimThresholdMet"]),
                    "claimSubmittedRelativeToTravel": d["ClaimSubmittedRelativeToTravel"]}
-        log.info("scored claim=%s decision=%s p=%.4f latency=%.1fms", claim.get("ClaimID"),
-                 result["decision"], result["P(approved)"], latency)
-        return jsonify(claimId=claim.get("ClaimID"),            # echo the SAME claim id back
-                       decision=result["decision"], probabilityApproved=result["P(approved)"],
-                       threshold=round(bundle["threshold"], 4), referBand=pmg.REFER_BAND,
-                       signals=signals, modelName=bundle["model_name"], latencyMs=latency)
+        response = dict(claimId=claim.get("ClaimID"),               # echo the SAME claim id back
+                        decision=result["decision"], probabilityApproved=result["P(approved)"],
+                        threshold=round(bundle["threshold"], 4), referBand=pmg.REFER_BAND,
+                        signals=signals, modelName=bundle["model_name"], latencyMs=latency)
+        log.info(f"model {bundle['model_name']} predicted P(approved)={result['P(approved)']} -> {result['decision']} in {latency}ms", trace=trace)
+        log.debug(f"decision rule: APPROVE if P >= {bundle['threshold'] + pmg.REFER_BAND:.4f}, "
+                  f"REFER if |P - {bundle['threshold']:.4f}| <= {pmg.REFER_BAND}, else REJECT", trace=trace)
+        log.info(f"==== ML RESPONSE SENT  (ML model -> backend) ==== HTTP 200 -> {result['decision']} (P={result['P(approved)']})",
+                 {"status": 200, "body": response}, trace=trace)
+        log.summary(f"SCORED claim={claim.get('ClaimID')} -> {result['decision']} (P={result['P(approved)']}) model={latency}ms", trace=trace)
+        return jsonify(response)
 
     @app.errorhandler(413)
     def too_large(_):
@@ -157,7 +174,9 @@ def create_app() -> Flask:
 
     @app.errorhandler(Exception)
     def unexpected(e):                                          # never leak stack traces to callers
-        log.exception("unhandled error")
+        if isinstance(e, HTTPException):                        # 404/405/... keep their own status code
+            return jsonify(error=e.description), e.code
+        log.error(f"unhandled error: {e!r}")
         return jsonify(error="internal error"), 500
 
     return app

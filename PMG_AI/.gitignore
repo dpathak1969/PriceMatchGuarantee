@@ -6,3 +6,5 @@ backend/.env
 backend/data/
 backend/uploads/
 *.log
+backend/logs/
+ml_service/logs/
