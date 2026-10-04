@@ -1,2 +1,8 @@
 VENV_PMG/
 __pycache__/
+node_modules/
+frontend/dist/
+backend/.env
+backend/data/
+backend/uploads/
+*.log
