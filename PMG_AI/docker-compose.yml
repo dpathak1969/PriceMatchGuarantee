@@ -1,0 +1,27 @@
+# Method 1 (recommended): three containers.  Run:  docker compose up --build   then open port 8080.
+services:
+  ml:
+    build: { context: ., dockerfile: ml_service/Dockerfile }
+    environment:
+      ML_API_KEY: ${ML_API_KEY:?set ML_API_KEY in .env}
+    volumes: [ml-logs:/logs]
+    restart: unless-stopped            # no published port: only the backend can reach it
+
+  backend:
+    build: ./backend
+    environment:
+      ML_URL: http://ml:5001           # service name resolves on the compose network
+      ML_API_KEY: ${ML_API_KEY:?set ML_API_KEY in .env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes: [pmg-state:/var/pmg]      # uploads, claim log, logs survive restarts
+    depends_on: { ml: { condition: service_healthy } }
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on: [backend]
+    restart: unless-stopped
+
+volumes: { ml-logs: {}, pmg-state: {} }

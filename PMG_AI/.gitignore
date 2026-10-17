@@ -8,3 +8,6 @@ backend/uploads/
 *.log
 backend/logs/
 ml_service/logs/
+
+# docker compose secrets
+.env
